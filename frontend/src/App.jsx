@@ -9,7 +9,7 @@ import {
   useParams,
 } from 'react-router-dom'
 import axios from 'axios'
-import { MapContainer, Marker, Popup, TileLayer, CircleMarker } from 'react-leaflet'
+import { MapContainer, Popup, TileLayer, CircleMarker } from 'react-leaflet'
 import {
   Bar,
   BarChart,
@@ -85,6 +85,22 @@ const statusColors = {
   Resolved: '#10B981',
 }
 
+const EMPTY_DASHBOARD = {
+  total: 0,
+  pending: 0,
+  inProgress: 0,
+  resolved: 0,
+  highUrgency: 0,
+  resolutionRate: 0,
+  dailyTrend: [],
+  categoryDistribution: [],
+  areaStats: [],
+  recentActivity: [],
+  insightCards: [],
+  repeatedByLocation: [],
+  unresolvedAreas: [],
+}
+
 const apiClient = axios.create({ baseURL: API_BASE })
 
 const getAdminHeaders = () => {
@@ -97,10 +113,103 @@ const getUserHeaders = () => {
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
+const MAX_RECORDING_SECONDS = 30
+
+async function convertAudioBlobToWav(blob) {
+  if (!blob || !blob.size) {
+    throw new Error('No audio data was recorded.')
+  }
+
+  const signature = new Uint8Array(await blob.slice(0, 12).arrayBuffer())
+  const isWav = signature.length >= 12
+    && String.fromCharCode(...signature.slice(0, 4)) === 'RIFF'
+    && String.fromCharCode(...signature.slice(8, 12)) === 'WAVE'
+  if (isWav) {
+    return blob
+  }
+
+  if (typeof window === 'undefined' || !window.AudioContext && !window.webkitAudioContext) {
+    throw new Error('This browser cannot convert its recording to Gnani-supported WAV audio.')
+  }
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext
+  const audioContext = new AudioContextClass()
+
+  try {
+    const arrayBuffer = await blob.arrayBuffer()
+    const decoded = await audioContext.decodeAudioData(arrayBuffer.slice(0))
+    const channels = []
+    for (let channel = 0; channel < decoded.numberOfChannels; channel += 1) {
+      channels.push(decoded.getChannelData(channel))
+    }
+
+    const interleavedLength = decoded.length * decoded.numberOfChannels
+    const interleaved = new Float32Array(interleavedLength)
+    let index = 0
+
+    for (let sampleIndex = 0; sampleIndex < decoded.length; sampleIndex += 1) {
+      channels.forEach((channelData) => {
+        interleaved[index] = channelData[sampleIndex]
+        index += 1
+      })
+    }
+
+    const wavBuffer = new ArrayBuffer(44 + interleaved.length * 2)
+    const view = new DataView(wavBuffer)
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i += 1) {
+        view.setUint8(offset + i, string.charCodeAt(i))
+      }
+    }
+
+    writeString(0, 'RIFF')
+    view.setUint32(4, 36 + interleaved.length * 2, true)
+    writeString(8, 'WAVE')
+    writeString(12, 'fmt ')
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true)
+    view.setUint16(22, decoded.numberOfChannels, true)
+    view.setUint32(24, decoded.sampleRate, true)
+    view.setUint32(28, decoded.sampleRate * decoded.numberOfChannels * 2, true)
+    view.setUint16(32, decoded.numberOfChannels * 2, true)
+    view.setUint16(34, 16, true)
+    writeString(36, 'data')
+    view.setUint32(40, interleaved.length * 2, true)
+
+    let offset = 44
+    for (let i = 0; i < interleaved.length; i += 1) {
+      const sample = Math.max(-1, Math.min(1, interleaved[i]))
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+      offset += 2
+    }
+
+    return new Blob([wavBuffer], { type: 'audio/wav' })
+  } finally {
+    await audioContext.close()
+  }
+}
+
 const formatDate = (value) => {
   if (!value) return 'Not available'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+function getVerifiedMapCoordinates(complaint) {
+  const { latitude, longitude } = complaint.coordinates || {}
+  if (
+    complaint.locationSource !== 'geocoded'
+    || complaint.geocodingStatus !== 'success'
+    || !Number.isFinite(latitude)
+    || !Number.isFinite(longitude)
+    || latitude < -90
+    || latitude > 90
+    || longitude < -180
+    || longitude > 180
+  ) {
+    return null
+  }
+  return [latitude, longitude]
 }
 
 function App() {
@@ -456,11 +565,13 @@ function ReportIssuePage() {
   const mediaRecorderRef = useRef(null)
   const streamRef = useRef(null)
   const chunksRef = useRef([])
+  const recordingTimeoutRef = useRef(null)
 
   const [language, setLanguage] = useState('Tamil')
   const [transcript, setTranscript] = useState('')
   const [category, setCategory] = useState('Garbage Collection')
   const [location, setLocation] = useState('')
+  const [locationError, setLocationError] = useState('')
   const [description, setDescription] = useState('')
   const [audioUrl, setAudioUrl] = useState('')
   const [recordingSeconds, setRecordingSeconds] = useState(0)
@@ -468,11 +579,14 @@ function ReportIssuePage() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [statusMessage, setStatusMessage] = useState('')
   const [demoMode, setDemoMode] = useState(false)
+  const [transcriptionAttempted, setTranscriptionAttempted] = useState(false)
   const [processingStage, setProcessingStage] = useState('idle')
   const [classificationResult, setClassificationResult] = useState({ category: 'Garbage Collection', urgency: 'Medium', explanation: 'Pending analysis.' })
   const [submittedTicket, setSubmittedTicket] = useState(null)
   const [confirmationText, setConfirmationText] = useState('')
+  const [confirmationMessage, setConfirmationMessage] = useState('')
   const [audioData, setAudioData] = useState('')
+  const [confirmationContentType, setConfirmationContentType] = useState('audio/wav')
 
   useEffect(() => {
     if (!isRecording) return undefined
@@ -522,9 +636,13 @@ function ReportIssuePage() {
     }
 
     try {
+      setDemoMode(false)
+      setTranscriptionAttempted(false)
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       streamRef.current = stream
-      const mediaRecorder = new MediaRecorder(stream)
+      const supportedMimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus']
+        .find((mimeType) => MediaRecorder.isTypeSupported(mimeType))
+      const mediaRecorder = new MediaRecorder(stream, supportedMimeType ? { mimeType: supportedMimeType } : undefined)
       chunksRef.current = []
       mediaRecorderRef.current = mediaRecorder
 
@@ -535,32 +653,58 @@ function ReportIssuePage() {
       }
 
       mediaRecorder.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-        const localUrl = URL.createObjectURL(blob)
-        setAudioUrl(localUrl)
-        stream.getTracks().forEach((track) => track.stop())
-
-        if (blob.size > 0) {
-          setProcessingStage('uploading')
-          setStatusMessage('Sending audio to backend for transcription...')
-          const formData = new FormData()
-          formData.append('audio', blob, 'voice-recording.webm')
-
-          try {
-            const response = await apiClient.post('/complaints/transcribe', formData, {
-              headers: { 'Content-Type': 'multipart/form-data' },
-            })
-            const nextTranscript = response.data.transcript || ''
-            setTranscript(nextTranscript)
-            setDemoMode(Boolean(response.data.mode === 'demo'))
-            setStatusMessage(response.data.message || 'Audio processed successfully.')
-            if (nextTranscript) setProcessingStage('transcribing')
-          } catch (error) {
-            const message = error?.response?.data?.message || 'Unable to transcribe the audio right now.'
-            setStatusMessage(message)
+        const rawBlob = new Blob(chunksRef.current, { type: mediaRecorder.mimeType || 'audio/webm' })
+        try {
+          const wavBlob = await convertAudioBlobToWav(rawBlob)
+          if (wavBlob.size > 20 * 1024 * 1024) {
+            throw new Error('Recording too large after WAV conversion. Keep it under 20MB and under 30 seconds.')
           }
+
+          const localUrl = URL.createObjectURL(wavBlob)
+          setAudioUrl((previousUrl) => {
+            if (previousUrl) URL.revokeObjectURL(previousUrl)
+            return localUrl
+          })
+
+          stream.getTracks().forEach((track) => track.stop())
+
+          setProcessingStage('uploading')
+          setStatusMessage(`Sending converted WAV audio (${wavBlob.size} bytes) to Gnani for Tamil transcription...`)
+          const formData = new FormData()
+          formData.append('audio', wavBlob, 'voice-recording.wav')
+          formData.append('language', language)
+
+          const response = await apiClient.post('/complaints/transcribe', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+          })
+          const nextTranscript = response.data.transcript || ''
+          setTranscript(nextTranscript)
+          setDemoMode(Boolean(response.data.mode === 'demo'))
+          setTranscriptionAttempted(true)
+          setStatusMessage(response.data.message || 'Audio processed successfully.')
+          if (nextTranscript) setProcessingStage('transcribing')
+        } catch (error) {
+          const failure = error?.response?.data
+          if (failure?.mode === 'demo') {
+            setTranscript('')
+            setDemoMode(true)
+            setTranscriptionAttempted(true)
+            setProcessingStage('confirming')
+            setStatusMessage(failure.message || 'Live transcription failed. Enter or edit the complaint text manually.')
+          } else {
+            setStatusMessage(error?.message || failure?.message || 'Unable to transcribe the audio right now.')
+          }
+          stream.getTracks().forEach((track) => track.stop())
         }
       }
+
+      if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current)
+      recordingTimeoutRef.current = setTimeout(() => {
+        if (mediaRecorderRef.current?.state === 'recording') {
+          mediaRecorderRef.current.stop()
+          setIsRecording(false)
+        }
+      }, MAX_RECORDING_SECONDS * 1000)
 
       mediaRecorder.start()
       setRecordingSeconds(0)
@@ -573,6 +717,11 @@ function ReportIssuePage() {
   }
 
   const stopRecording = () => {
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current)
+      recordingTimeoutRef.current = null
+    }
+
     if (mediaRecorderRef.current && isRecording) {
       mediaRecorderRef.current.stop()
       setIsRecording(false)
@@ -582,12 +731,23 @@ function ReportIssuePage() {
   const handleSubmit = async (event) => {
     event.preventDefault()
 
+    if (typeof location !== 'string' || !location.trim()) {
+      setLocationError('Enter a locality or nearby landmark to submit this complaint.')
+      return
+    }
+
+    if (location.trim().length > 250) {
+      setLocationError('Location must be 250 characters or fewer.')
+      return
+    }
+
     if (!transcript.trim()) {
       setStatusMessage('Add a complaint description or record audio before submitting.')
       return
     }
 
     try {
+      setLocationError('')
       setIsSubmitting(true)
       setProcessingStage('creating')
       setStatusMessage('Creating complaint ticket in the civic operations database...')
@@ -595,24 +755,29 @@ function ReportIssuePage() {
       const response = await apiClient.post('/complaints', {
         complaintText: transcript,
         category,
-        location: location || 'Chennai, Tamil Nadu',
+        location,
         language,
         description,
-        source: 'voice',
         urgency: classificationResult.urgency,
-        classificationReason: classificationResult.explanation,
       })
 
       setSubmittedTicket(response.data)
       setProcessingStage('confirmation')
-      setStatusMessage('Complaint ticket created successfully.')
+      const persistenceMessage = response.data.persistenceMode === 'mongodb'
+        ? 'Complaint persisted in MongoDB.'
+        : 'Demo mode: this ticket is held in memory only and is not durable.'
+      setStatusMessage(`${persistenceMessage} ${response.data.geocodingMessage || ''}`.trim())
 
       try {
         const confirmation = await apiClient.get(`/complaints/${response.data.ticketId}/confirmation`)
         setConfirmationText(confirmation.data.text || 'Complaint saved successfully.')
         setAudioData(confirmation.data.audioBase64 || '')
+        setConfirmationContentType(confirmation.data.audioContentType || 'audio/wav')
+        setConfirmationMessage(confirmation.data.message || (confirmation.data.generated ? 'Gnani Timbre audio is ready.' : 'Text-only confirmation; no TTS audio was generated.'))
       } catch (confirmationError) {
         setConfirmationText('உங்கள் புகார் பதிவு செய்யப்பட்டுள்ளது. விரைவில் நடவடிக்கை எடுக்கப்படும்.')
+        setConfirmationContentType('audio/wav')
+        setConfirmationMessage('Text-only confirmation: Tamil speech audio is unavailable.')
       }
 
       navigate(`/complaints/${response.data.ticketId}`)
@@ -632,7 +797,11 @@ function ReportIssuePage() {
       <div className="mb-8 rounded-3xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
         <div className="flex items-center gap-2 font-medium">
           <AlertTriangle className="h-4 w-4" />
-          Demo transcription mode is active when Gnani API credentials are unavailable. No fake API call is reported as successful.
+          {demoMode
+            ? 'Manual/demo fallback is active. Gnani did not return a transcript; enter or edit the complaint text manually.'
+            : transcriptionAttempted
+              ? 'Gnani responded to the transcription request. The returned transcript is editable before submission.'
+              : 'Speech transcription is unverified until Gnani returns a successful response. Manual text entry remains available.'}
         </div>
       </div>
 
@@ -644,7 +813,7 @@ function ReportIssuePage() {
               <h2 className="mt-2 text-3xl font-bold text-slate-900">Report a civic issue</h2>
             </div>
             <div className="rounded-full border border-slate-200 bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
-              {demoMode ? 'Demo transcription mode' : 'Live transcription mode'}
+              {demoMode ? 'Manual/demo fallback' : transcriptionAttempted ? 'Gnani response received' : 'Transcription not yet verified'}
             </div>
           </div>
 
@@ -713,8 +882,22 @@ function ReportIssuePage() {
               </select>
             </div>
             <div>
-              <label className="mb-2 block text-sm font-medium text-slate-700">Location</label>
-              <input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="Anna Nagar, Chennai" className="w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none focus:border-emerald-500" />
+              <label htmlFor="complaint-location" className="mb-2 block text-sm font-medium text-slate-700">Location <span className="text-red-600">*</span></label>
+              <input
+                id="complaint-location"
+                value={location}
+                onChange={(event) => {
+                  setLocation(event.target.value)
+                  if (locationError) setLocationError('')
+                }}
+                placeholder="Anna Nagar, Chennai"
+                maxLength={250}
+                required
+                aria-invalid={Boolean(locationError)}
+                aria-describedby={locationError ? 'complaint-location-error' : undefined}
+                className="w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none focus:border-emerald-500"
+              />
+              {locationError && <p id="complaint-location-error" className="mt-2 text-sm text-red-700">{locationError}</p>}
             </div>
           </div>
 
@@ -752,6 +935,7 @@ function ReportIssuePage() {
               <InfoListRow label="Location" value={location || 'Not extracted yet'} />
               <InfoListRow label="Transcript language" value={language} />
               <InfoListRow label="Reason" value={classificationResult.explanation || 'Awaiting classification'} />
+              {transcriptionAttempted && <InfoListRow label="Speech transcription" value={demoMode ? 'Manual/demo fallback — no live AI transcript returned' : 'Gnani API response'} />}
             </div>
           </div>
 
@@ -785,9 +969,13 @@ function ReportIssuePage() {
             <div className="rounded-[28px] border border-emerald-200 bg-emerald-50 p-5 text-sm text-emerald-900">
               <div className="font-semibold">Ticket created</div>
               <div className="mt-2">#{submittedTicket.ticketId}</div>
+              {submittedTicket.persistenceMode === 'demo-memory' && (
+                <div className="mt-2 font-semibold text-amber-800">Demo only: not saved to MongoDB and may be lost when the server restarts.</div>
+              )}
               {confirmationText && <div className="mt-3">{confirmationText}</div>}
+              {confirmationMessage && <div className="mt-2 text-xs">{confirmationMessage}</div>}
               {audioData && (
-                <audio controls src={`data:audio/mpeg;base64,${audioData}`} className="mt-3 w-full" />
+                <audio controls src={`data:${confirmationContentType};base64,${audioData}`} className="mt-3 w-full" />
               )}
             </div>
           )}
@@ -798,21 +986,7 @@ function ReportIssuePage() {
 }
 
 function DashboardPage() {
-  const [dashboard, setDashboard] = useState({
-    total: 0,
-    pending: 0,
-    inProgress: 0,
-    resolved: 0,
-    highUrgency: 0,
-    resolutionRate: 0,
-    dailyTrend: [],
-    categoryDistribution: [],
-    areaStats: [],
-    recentActivity: [],
-    insightCards: [],
-    repeatedByLocation: [],
-    unresolvedAreas: [],
-  })
+  const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD)
   const [complaints, setComplaints] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
@@ -820,18 +994,24 @@ function DashboardPage() {
   const [statusFilter, setStatusFilter] = useState('All')
   const [urgencyFilter, setUrgencyFilter] = useState('All')
   const [mapView, setMapView] = useState('map')
+  const [loadError, setLoadError] = useState('')
 
   const loadData = async () => {
     try {
       setLoading(true)
+      setLoadError('')
       const [complaintsResponse, dashboardResponse] = await Promise.all([
-        apiClient.get('/complaints'),
-        apiClient.get('/dashboard'),
+        apiClient.get('/admin/complaints', { headers: getAdminHeaders() }),
+        apiClient.get('/dashboard', { headers: getAdminHeaders() }),
       ])
       setComplaints(complaintsResponse.data)
       setDashboard(dashboardResponse.data)
     } catch (error) {
-      console.error('Failed to load dashboard analytics', error)
+      setComplaints([])
+      setDashboard(EMPTY_DASHBOARD)
+      setLoadError(error?.response?.status === 401 || error?.response?.status === 403
+        ? 'Admin sign-in is required to view complaint records and analytics.'
+        : 'Unable to load dashboard data. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -850,6 +1030,10 @@ function DashboardPage() {
       return matchesSearch && matchesCategory && matchesStatus && matchesUrgency
     })
   }, [complaints, search, categoryFilter, statusFilter, urgencyFilter])
+  const mappedComplaints = useMemo(
+    () => filteredComplaints.filter((complaint) => getVerifiedMapCoordinates(complaint)),
+    [filteredComplaints],
+  )
 
   const analyticsCards = [
     { label: 'Total complaints', value: dashboard.total, accent: 'bg-slate-900 text-white' },
@@ -872,6 +1056,12 @@ function DashboardPage() {
         </button>
       </div>
 
+      {loadError && (
+        <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          {loadError} <Link to="/admin" className="font-semibold underline">Open admin sign in</Link>
+        </div>
+      )}
+
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         {analyticsCards.map((card) => (
           <div key={card.label} className={`rounded-[24px] p-5 ${card.accent}`}>
@@ -885,7 +1075,7 @@ function DashboardPage() {
         <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
           <div className="mb-4 flex items-center justify-between gap-2">
             <h3 className="text-lg font-bold text-slate-900">Daily complaint trend</h3>
-            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Real data</div>
+            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Complaint records</div>
           </div>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
@@ -997,8 +1187,8 @@ function DashboardPage() {
           <div className="mt-6 h-[420px] w-full overflow-hidden rounded-[24px] border border-slate-200">
             <MapContainer center={[13.0827, 80.2707]} zoom={11} scrollWheelZoom className="h-full w-full">
               <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
-              {filteredComplaints.map((complaint) => {
-                const coordinates = Array.isArray(complaint.coordinates) && complaint.coordinates.length === 2 ? complaint.coordinates : [13.0827, 80.2707]
+              {mappedComplaints.map((complaint) => {
+                const coordinates = getVerifiedMapCoordinates(complaint)
                 return (
                   <CircleMarker key={complaint.ticketId} center={coordinates} radius={10} pathOptions={{ color: statusColors[complaint.status] || '#64748B', fillColor: statusColors[complaint.status] || '#64748B', fillOpacity: 0.9 }}>
                     <Popup>
@@ -1006,12 +1196,18 @@ function DashboardPage() {
                         <div className="font-bold text-slate-900">{complaint.ticketId}</div>
                         <div className="mt-1">{complaint.category}</div>
                         <div className="mt-1 text-slate-600">{complaint.status}</div>
+                        <div className="mt-1 text-slate-600">Urgency: {complaint.urgency}</div>
+                        <div className="mt-1 text-slate-600">Location: {complaint.location}</div>
+                        <div className="mt-1 text-xs text-slate-500">Approximate geocoded address match; not exact user GPS.</div>
                       </div>
                     </Popup>
                   </CircleMarker>
                 )
               })}
             </MapContainer>
+            {mappedComplaints.length === 0 && (
+              <p className="px-4 py-2 text-sm text-slate-600">No filtered complaints have verified map coordinates. Locations remain available in the list.</p>
+            )}
           </div>
         ) : (
           <div className="mt-6 overflow-hidden rounded-[24px] border border-slate-200">
@@ -1065,7 +1261,10 @@ function ComplaintDetailsPage() {
     const fetchComplaint = async () => {
       setLoading(true)
       try {
-        const response = await apiClient.get(`/complaints/${id}`)
+        const adminToken = localStorage.getItem('nammafix-admin-token')
+        const response = adminToken
+          ? await apiClient.get(`/admin/complaints/${id}`, { headers: getAdminHeaders() })
+          : await apiClient.get(`/complaints/${id}`)
         setComplaint(response.data)
       } catch (error) {
         setComplaint(null)
@@ -1129,13 +1328,13 @@ function ComplaintDetailsPage() {
           </div>
         </div>
 
-        <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+        {complaint.complaintText && <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
           <div className="mb-4 flex items-center gap-2 text-lg font-bold text-slate-900">
             <FileText className="h-5 w-5 text-emerald-600" />
             Complaint description
           </div>
           <p className="rounded-2xl bg-slate-50 p-4 text-slate-700">{complaint.complaintText}</p>
-        </div>
+        </div>}
 
         <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
           <div className="mb-4 flex items-center gap-2 text-lg font-bold text-slate-900">
@@ -1154,7 +1353,7 @@ function ComplaintDetailsPage() {
                     <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone[entry.status] || 'bg-slate-100 text-slate-700 ring-slate-200'}`}>{entry.status}</span>
                     <span className="text-xs text-slate-500">{formatDate(entry.timestamp)}</span>
                   </div>
-                  <p className="mt-2 text-sm text-slate-600">{entry.note}</p>
+                  {entry.note && <p className="mt-2 text-sm text-slate-600">{entry.note}</p>}
                 </div>
               </div>
             ))}
@@ -1226,10 +1425,10 @@ function TrackingPage() {
             </div>
           </div>
 
-          <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+          {complaint.complaintText && <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
             <div className="mb-4 flex items-center gap-2 text-lg font-bold text-slate-900"><FileText className="h-5 w-5 text-emerald-600" /> Complaint description</div>
             <p className="rounded-2xl bg-slate-50 p-4 text-slate-700">{complaint.complaintText}</p>
-          </div>
+          </div>}
 
           <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
             <div className="mb-4 flex items-center gap-2 text-lg font-bold text-slate-900"><Clock3 className="h-5 w-5 text-emerald-600" /> Status timeline</div>
@@ -1245,7 +1444,7 @@ function TrackingPage() {
                       <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone[entry.status] || 'bg-slate-100 text-slate-700 ring-slate-200'}`}>{entry.status}</span>
                       <span className="text-xs text-slate-500">{formatDate(entry.timestamp)}</span>
                     </div>
-                    <p className="mt-2 text-sm text-slate-600">{entry.note}</p>
+                    {entry.note && <p className="mt-2 text-sm text-slate-600">{entry.note}</p>}
                   </div>
                 </div>
               ))}
@@ -1266,8 +1465,8 @@ function TrackingPage() {
 
 function AdminPage() {
   const [token, setToken] = useState(localStorage.getItem('nammafix-admin-token') || '')
-  const [username, setUsername] = useState('admin')
-  const [password, setPassword] = useState('admin123')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
   const [complaints, setComplaints] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
