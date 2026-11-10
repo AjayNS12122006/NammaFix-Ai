@@ -1,84 +1,171 @@
-# NammaFix AI
+NammaFix AI – Tamil Voice-Powered Civic Complaint Assistant 🇮🇳
 
-NammaFix AI is a multilingual, voice-first civic complaint tracking prototype for Tamil, English, and Tanglish users.
+Making civic complaint reporting simpler, smarter, and more accessible through AI-powered voice interaction.
 
-## Features
+NammaFix AI is a voice-powered civic complaint assistant designed to help citizens report local civic issues using Tamil, English, and Tanglish. It simplifies the reporting process through voice interaction, location-based complaint registration, automatic categorization, and ticket-based complaint tracking.
 
-- Complaint capture with editable speech transcription and explicit manual fallback
-- Gnani Prisma STT and Timbre TTS integration
-- Rule-based complaint category and urgency suggestions
-- MongoDB-backed complaint and user storage
-- Public ticket tracking with a limited response, plus admin-only complaint and analytics APIs
-- Admin dashboard with filters, map, and list views
-- Address-preserving location storage and optional OpenStreetMap Nominatim geocoding
+🎯 Problem Statement
 
-## Local setup
+Citizens often face difficulties reporting everyday civic problems such as garbage accumulation, water leakage, damaged roads, drainage issues, and streetlight failures.
 
-In PowerShell:
+Common challenges include:
 
-```powershell
-Set-Location backend
-Copy-Item .env.example .env
+- Language barriers in complaint registration.
+- Complicated reporting procedures.
+- Difficulty tracking complaint progress.
+- Limited visibility into complaint management.
+
+💡 Our Solution
+
+NammaFix AI provides a simple, accessible platform where citizens can report civic problems using voice or text.
+
+The platform helps organize complaints, capture location information, generate unique ticket IDs, and provide a tracking interface. Administrators can manage complaints through a centralized dashboard.
+
+✨ Key Features
+
+🎙️ Voice-Based Complaint Reporting
+
+- Voice input for reporting civic issues.
+- Designed for Tamil, English, and Tanglish interaction.
+- Gnani AI Prisma Speech-to-Text integration.
+- Gnani AI Timbre Text-to-Speech integration.
+
+📍 Location-Based Reporting
+
+- Capture complaint address and location details.
+- Geocoding using OpenStreetMap Nominatim.
+- Display validated complaint coordinates on a map.
+- Preserve the original address supplied by the citizen.
+
+📝 Complaint Management
+
+- Categorize complaints by civic issue type.
+- Record complaint descriptions and urgency.
+- Generate unique complaint ticket IDs.
+- Track complaint status.
+
+📊 Admin Dashboard
+
+- View and manage registered complaints.
+- Monitor pending, in-progress, and resolved complaints.
+- View complaint statistics and category distribution.
+- Monitor complaint locations on a map.
+
+🔎 Complaint Tracking
+
+- Track complaints using ticket IDs.
+- View available complaint status information.
+- Improve transparency in the complaint management process.
+
+🛠️ Technology Stack
+
+Component| Technologies
+Frontend| React.js, Vite
+Styling| Tailwind CSS
+Routing| React Router DOM
+Backend| Node.js, Express.js
+Database| MongoDB
+AI Speech| Gnani AI Prisma and Timbre
+Maps| React Leaflet, Leaflet
+Geocoding| OpenStreetMap Nominatim
+API Communication| Axios
+
+🏗️ System Architecture
+
+1. Citizen Interface: Citizens submit civic complaints using voice or text.
+2. Voice Processing: Gnani AI speech services support speech recognition and voice responses.
+3. Backend Processing: Express.js handles authentication, complaint registration, and tracking.
+4. Database: MongoDB stores complaint and user information.
+5. Location Services: Geocoding converts supported addresses into geographic coordinates.
+6. Admin Interface: Administrators review and manage complaints.
+
+🔄 Complaint Workflow
+
+1. Citizen opens NammaFix AI.
+2. Citizen enters a complaint using voice or text.
+3. Complaint details and location are reviewed.
+4. Citizen confirms the complaint.
+5. Backend stores the complaint and generates a ticket ID.
+6. Citizen tracks the complaint.
+7. Administrator reviews and updates its status.
+
+Note: The current platform provides an internal complaint management workflow. It does not claim official submission to a municipal corporation or government authority unless an authorized integration is configured.
+
+🌍 Expected Impact
+
+- Makes civic reporting easier for local-language users.
+- Reduces barriers to submitting complaints.
+- Improves visibility into complaint progress.
+- Helps administrators organize and monitor civic issues.
+- Provides a foundation for future authorized municipal integrations.
+
+🚀 Future Enhancements
+
+- Integration with authorized municipal complaint APIs.
+- More regional language support.
+- AI-assisted complaint classification.
+- Image-based civic issue recognition.
+- SMS and WhatsApp notifications.
+- Municipal officer assignment and management.
+- Advanced analytics and reporting.
+
+⚙️ Installation and Setup
+
+Prerequisites
+
+- Node.js
+- npm
+- MongoDB
+- Git
+
+Clone the Repository
+
+git clone https://github.com/AjayNS12122006/NammaFix-Ai.git
+cd NammaFix-Ai
+
+Backend Setup
+
+cd backend
+npm install
+
+Create a ".env" file using the provided ".env.example" as a reference. Configure your MongoDB connection and required API credentials locally.
+
+Start the backend:
+
+npm run dev
+
+Frontend Setup
+
+Open another terminal:
+
 npm install
 npm run dev
-```
 
-In a second terminal:
+Open the local Vite URL displayed in your terminal.
 
-```powershell
-Set-Location frontend
-npm install
-npm run dev
-```
+🔐 Security and Privacy
 
-Set strong, private values in `backend/.env`. Never commit `.env` or paste credentials into source files. For production, configure `NODE_ENV=production`, a JWT secret of at least 32 characters, admin credentials, and a reachable MongoDB URI; the backend refuses to start without these requirements and does not fall back to in-memory storage in production.
+- Password hashing for account security.
+- Role-based access for administrative features.
+- Protected complaint management endpoints.
+- Environment variables for sensitive configuration.
+- Restricted access to private complaint records.
 
-## Environment
+👨‍💻 Developer
 
-See [`backend/.env.example`](./backend/.env.example) for variable names and safe placeholders.
+Ajay N.S.
 
-- `MONGO_URI` configures MongoDB.
-- `JWT_SECRET`, `ADMIN_USERNAME`, and `ADMIN_PASSWORD` configure token signing and admin login.
-- `GNANI_API_KEY` configures Gnani STT and can also be used for TTS; `GNANI_TTS_API_KEY` can override it for TTS.
-- `GNANI_API_URL` and `GNANI_TTS_API_URL` override the provider endpoints.
-- `GNANI_TIMEOUT_MS` controls provider request timeouts.
-- `NOMINATIM_BASE_URL`, `NOMINATIM_CONTACT_EMAIL`, and `NOMINATIM_TIMEOUT_MS` configure the geocoder request identity and timeout.
-- `CLIENT_URL` sets the allowed browser origin.
+BE Computer Science and Engineering
+Sri Shakthi Institute of Engineering and Technology
 
-The backend health endpoint is `GET /api/health`. It reports connection state and mode only; it does not return environment values.
+GitHub: https://github.com/AjayNS12122006
 
-## Location and map behavior
+🏆 Project Information
 
-The entered location is required and stored as provided; it is not replaced with a city default. Geocoding stores latitude and longitude separately and does not change the original address. Map markers are shown only for valid coordinates returned by the configured geocoder. A geocoded address is an approximate address match, not the reporter's exact GPS position. If the geocoder is unavailable or finds no match, the complaint remains saved with its location text and no marker coordinates.
+Project Name: NammaFix AI
+Challenge: The Great Indian AI Internship Challenge 2026
+Domain: Artificial Intelligence | Voice AI | Civic Technology
 
-Nominatim is a shared, rate-limited service. The backend serializes requests, caches successful lookups, and sends an identifying User-Agent. Use an appropriate contact address and review the current provider usage policy before production deployment.
+---
 
-## Speech and demo behavior
-
-The browser converts recorded audio to WAV before upload; it never labels an unconverted WebM recording as WAV. The backend validates supported audio signatures before sending audio to Gnani. Tamil speech is sent with the `ta-IN` language code. If credentials are missing or a live transcription fails, the response has an empty transcript and an explicit manual/demo status; no fabricated transcript is presented as AI output.
-
-TTS requests Timbre v2.5 with Tamil and WAV/linear PCM output. Audio is presented only after the backend validates a WAV response; otherwise the Tamil confirmation text remains available with a clear fallback message.
-
-## API access
-
-- `GET /api/complaints/:ticketId` supports public ticket tracking and omits complaint text and internal notes.
-- Complaint lists, dashboard analytics, and full complaint details under `/api/admin/*` require an admin token.
-- Complaint creation validates the location, category, language, urgency, and text before persistence.
-
-## Validation
-
-```powershell
-Set-Location backend
-npm test
-node --check server.js
-
-Set-Location ..\frontend
-npm run build
-npm run lint
-```
-
-The backend tests use an isolated local server and do not write to MongoDB or call Gnani.
-
-## Scope note
-
-This is a civic-technology prototype and does not represent an official government submission unless an actual government integration is implemented.
+NammaFix AI – Your Voice. Your Community. A Better Tomorrow.

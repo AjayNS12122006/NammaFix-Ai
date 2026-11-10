@@ -3,9 +3,9 @@ const cors = require('cors');
 const multer = require('multer');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const path = require('path');
+const { User, hashPassword, comparePassword } = require('./models/User');
 
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
@@ -13,7 +13,8 @@ const app = express();
 const PORT = Number(process.env.PORT || 5000);
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 const JWT_SECRET = process.env.JWT_SECRET;
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_NAME = process.env.ADMIN_NAME;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;  
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const MONGO_URI = process.env.MONGO_URI || '';
 const GNANI_API_KEY = process.env.GNANI_API_KEY || '';
@@ -26,13 +27,16 @@ const GEOCODER_USER_AGENT = `NammaFixAI/1.0 (${process.env.NOMINATIM_CONTACT_EMA
 const GEOCODER_TIMEOUT_MS = Number(process.env.NOMINATIM_TIMEOUT_MS || 7000);
 const isProduction = process.env.NODE_ENV === 'production';
 
-if (isProduction && (!JWT_SECRET || JWT_SECRET.length < 32 || !ADMIN_USERNAME || !ADMIN_PASSWORD || !MONGO_URI)) {
-  console.error('Production requires a 32-character JWT_SECRET, admin credentials, and MONGO_URI.');
+if (isProduction && (!JWT_SECRET || JWT_SECRET.length < 32 || !MONGO_URI)) {
+  console.error('Production requires a 32-character JWT_SECRET and MONGO_URI.');
   process.exit(1);
 }
-
-if (!isProduction && (!JWT_SECRET || !ADMIN_USERNAME || !ADMIN_PASSWORD)) {
-  console.error('Missing required environment variables: JWT_SECRET, ADMIN_USERNAME, and ADMIN_PASSWORD must be configured.');
+if (isProduction && (!CLIENT_URL.startsWith('https://') || /localhost|127\.0\.0\.1/i.test(CLIENT_URL))) {
+  console.error('Production requires a public HTTPS CLIENT_URL.');
+  process.exit(1);
+}
+if (!isProduction && !JWT_SECRET) {
+  console.error('Missing required environment variable: JWT_SECRET must be configured.');
 }
 
 app.use(
@@ -41,6 +45,14 @@ app.use(
     credentials: true,
   }),
 );
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), geolocation=(), microphone=(self)');
+  if (isProduction) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -55,6 +67,7 @@ let geocodeQueue = Promise.resolve();
 let lastGeocodeRequestAt = 0;
 const MAX_LOCATION_LENGTH = 250;
 const MAX_COMPLAINT_LENGTH = 5000;
+const MAX_TITLE_LENGTH = 120;
 const COMPLAINT_CATEGORIES = [
   'Garbage Collection',
   'Water Leakage',
@@ -369,6 +382,8 @@ const inMemoryComplaints = [
 const complaintSchema = new mongoose.Schema(
   {
     ticketId: { type: String, required: true, unique: true, index: true },
+    ownerId: { type: String, index: true, default: null },
+    title: { type: String, maxlength: MAX_TITLE_LENGTH, default: '' },
     complaintText: { type: String, required: true },
     category: { type: String, required: true },
     location: { type: String, required: true },
@@ -384,6 +399,7 @@ const complaintSchema = new mongoose.Schema(
     language: { type: String, default: 'English' },
     urgency: { type: String, default: 'Medium' },
     status: { type: String, default: 'Pending' },
+    authoritySubmissionStatus: { type: String, enum: ['not_submitted'], default: 'not_submitted' },
     description: { type: String, default: '' },
     source: { type: String, default: 'voice' },
     isSample: { type: Boolean, default: false },
@@ -396,19 +412,6 @@ const complaintSchema = new mongoose.Schema(
 );
 
 const Complaint = mongoose.models.Complaint || mongoose.model('Complaint', complaintSchema);
-
-const userSchema = new mongoose.Schema(
-  {
-    name: { type: String, required: true, trim: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash: { type: String, required: true },
-    role: { type: String, default: 'user' },
-    createdAt: { type: Date, default: Date.now },
-  },
-  { timestamps: true },
-);
-
-const User = mongoose.models.User || mongoose.model('User', userSchema);
 
 function ensureComplaintShape(complaint) {
   if (!complaint) return null;
@@ -436,11 +439,31 @@ function toPublicTrackingRecord(complaint) {
     ticketId: record.ticketId,
     category: record.category,
     status: record.status,
+    authoritySubmissionStatus: record.authoritySubmissionStatus || 'not_submitted',
+    submittedAt: record.submittedAt,
+    timeline: record.timeline.map(({ status, timestamp }) => ({ status, timestamp })),
+  };
+}
+
+function toCitizenComplaintRecord(complaint) {
+  const record = ensureComplaintShape(complaint);
+  if (!record) return null;
+  return {
+    ticketId: record.ticketId,
+    title: record.title,
+    complaintText: record.complaintText,
+    category: record.category,
+    status: record.status,
+    authoritySubmissionStatus: record.authoritySubmissionStatus || 'not_submitted',
     urgency: record.urgency,
     location: record.location,
-    submittedAt: record.submittedAt,
+    coordinates: record.coordinates,
+    locationSource: record.locationSource,
     geocodingStatus: record.geocodingStatus,
-    timeline: record.timeline.map(({ status, timestamp }) => ({ status, timestamp })),
+    language: record.language,
+    description: record.description,
+    submittedAt: record.submittedAt,
+    timeline: record.timeline,
   };
 }
 
@@ -474,9 +497,63 @@ async function findComplaintById(id) {
   return ensureComplaintShape(inMemoryComplaints.find((entry) => entry.ticketId === id) || null);
 }
 
+async function getCitizenComplaints(ownerId, page = 1, limit = 20) {
+  assertConfiguredMongoAvailable();
+  if (mongoose.connection.readyState === 1) {
+    const [records, total] = await Promise.all([
+      Complaint.find({ ownerId }).sort({ submittedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      Complaint.countDocuments({ ownerId }),
+    ]);
+    return { complaints: records.map(toCitizenComplaintRecord), total, page, pages: Math.ceil(total / limit) };
+  }
+  const owned = inMemoryComplaints
+    .filter((complaint) => complaint.ownerId === ownerId)
+    .sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
+  return {
+    complaints: owned.slice((page - 1) * limit, page * limit).map(toCitizenComplaintRecord),
+    total: owned.length,
+    page,
+    pages: Math.ceil(owned.length / limit),
+  };
+}
+
+async function getCitizenSummary(ownerId) {
+  assertConfiguredMongoAvailable();
+  if (mongoose.connection.readyState === 1) {
+    const [total, pending, inProgress, resolved] = await Promise.all([
+      Complaint.countDocuments({ ownerId }),
+      Complaint.countDocuments({ ownerId, status: 'Pending' }),
+      Complaint.countDocuments({ ownerId, status: 'In Progress' }),
+      Complaint.countDocuments({ ownerId, status: 'Resolved' }),
+    ]);
+    return { total, pending, inProgress, resolved };
+  }
+  const owned = inMemoryComplaints.filter((complaint) => complaint.ownerId === ownerId);
+  return {
+    total: owned.length,
+    pending: owned.filter((complaint) => normalizeStatus(complaint.status) === 'Pending').length,
+    inProgress: owned.filter((complaint) => normalizeStatus(complaint.status) === 'In Progress').length,
+    resolved: owned.filter((complaint) => normalizeStatus(complaint.status) === 'Resolved').length,
+  };
+}
+
+async function findCitizenComplaintById(ticketId, ownerId) {
+  assertConfiguredMongoAvailable();
+  if (mongoose.connection.readyState === 1) {
+    const complaint = await Complaint.findOne({ ticketId, ownerId }).lean();
+    return toCitizenComplaintRecord(complaint);
+  }
+  return toCitizenComplaintRecord(inMemoryComplaints.find(
+    (complaint) => complaint.ticketId === ticketId && complaint.ownerId === ownerId,
+  ) || null);
+}
+
 function validateComplaintPayload(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return 'A complaint object is required.';
+  }
+  if (typeof payload.title !== 'string' || !payload.title.trim() || payload.title.trim().length > MAX_TITLE_LENGTH) {
+    return `Complaint title is required and must be ${MAX_TITLE_LENGTH} characters or fewer.`;
   }
   if (typeof payload.location !== 'string' || !payload.location.trim()) {
     return 'Location is required.';
@@ -486,6 +563,9 @@ function validateComplaintPayload(payload) {
   }
   if (typeof payload.complaintText !== 'string' || !payload.complaintText.trim()) {
     return 'Complaint text is required.';
+  }
+  if (payload.confirmed !== true) {
+    return 'User confirmation is required before complaint submission.';
   }
   if (payload.complaintText.trim().length > MAX_COMPLAINT_LENGTH) {
     return `Complaint text must be ${MAX_COMPLAINT_LENGTH} characters or fewer.`;
@@ -505,7 +585,7 @@ function validateComplaintPayload(payload) {
   return null;
 }
 
-async function createComplaintFromPayload(payload) {
+async function createComplaintFromPayload(payload, ownerId) {
   const validationMessage = validateComplaintPayload(payload);
   if (validationMessage) {
     const error = new Error(validationMessage);
@@ -521,6 +601,8 @@ async function createComplaintFromPayload(payload) {
   const geocoding = await geocodeLocation(locationValue.trim());
   const complaintRecord = {
     ticketId: generateTicketId(),
+    ownerId,
+    title: payload.title.trim(),
     complaintText,
     category: payload.category || categoryResult.category,
     location: locationValue,
@@ -528,6 +610,7 @@ async function createComplaintFromPayload(payload) {
     language: payload.language || 'English',
     urgency: normalizeUrgency(payload.urgency || categoryResult.urgency),
     status: normalizedStatus,
+    authoritySubmissionStatus: 'not_submitted',
     description: payload.description || '',
     source: 'voice',
     isSample: false,
@@ -663,18 +746,16 @@ function createAdminToken(username) {
 }
 
 function createUserToken(user) {
-  return jwt.sign({ sub: user.email, role: user.role || 'user', name: user.name }, JWT_SECRET, { expiresIn: '12h' });
+  return jwt.sign({
+    sub: user.email,
+    id: String(user._id || user.id),
+    role: user.role === 'user' ? 'citizen' : (user.role || 'citizen'),
+    name: user.name,
+    tokenVersion: user.authVersion || 0,
+  }, JWT_SECRET, { expiresIn: '12h' });
 }
 
-async function hashPassword(password) {
-  return bcrypt.hash(String(password || ''), 12);
-}
-
-async function comparePassword(password, passwordHash) {
-  return bcrypt.compare(String(password || ''), passwordHash);
-}
-
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
@@ -682,12 +763,30 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ message: 'Authentication required.' });
   }
 
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    decoded = jwt.verify(token, JWT_SECRET);
+  } catch (error) {
+    return res.status(401).json({ message: 'Invalid or expired authentication token.' });
+  }
+
+  if (decoded.role === 'admin') {
+    req.user = decoded;
+    return next();
+  }
+
+  try {
+    const user = mongoose.connection.readyState === 1
+      ? await User.findById(decoded.id).lean()
+      : inMemoryUsers.find((entry) => entry.id === decoded.id);
+    if (!user || (decoded.tokenVersion || 0) !== (user.authVersion || 0)) {
+      return res.status(401).json({ message: 'Account session is no longer valid. Please sign in again.' });
+    }
     req.user = decoded;
     return next();
   } catch (error) {
-    return res.status(401).json({ message: 'Invalid or expired authentication token.' });
+    console.error('Authentication verification failed:', error.name);
+    return res.status(503).json({ message: 'Unable to verify the account session.' });
   }
 }
 
@@ -709,6 +808,15 @@ function requireAdmin(req, res, next) {
   } catch (error) {
     return res.status(401).json({ message: 'Invalid or expired admin token.' });
   }
+}
+
+function requireCitizen(req, res, next) {
+  return requireAuth(req, res, () => {
+    if (!['citizen', 'user'].includes(req.user.role) || !req.user.id) {
+      return res.status(403).json({ message: 'Citizen authorization required. Please sign in again if your session is old.' });
+    }
+    return next();
+  });
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = GNANI_TIMEOUT_MS) {
@@ -776,7 +884,7 @@ async function transcribeWithGnani(audioBuffer, mimeType, originalName, language
       throw invalidResponse;
     }
 
-    if (payload?.success !== true || typeof payload?.transcript !== 'string') {
+    if (payload?.success !== true || typeof payload?.transcript !== 'string' || !payload.transcript.trim()) {
       const invalidResponse = new Error('Gnani STT response did not contain a successful transcript.');
       invalidResponse.category = 'invalid_provider_response';
       throw invalidResponse;
@@ -804,7 +912,7 @@ async function transcribeWithGnani(audioBuffer, mimeType, originalName, language
 }
 
 async function synthesizeTamilConfirmation(text) {
-  const key = GNANI_API_KEY || GNANI_TTS_API_KEY;
+  const key = GNANI_TTS_API_KEY || GNANI_API_KEY;
   if (!key) {
     return {
       generated: false,
@@ -1017,18 +1125,18 @@ app.get('/api/health', (req, res) => {
   const status = isHealthy ? 200 : 503;
 
   res.status(status).json({
-  ok: isHealthy,
-  database: {
-    connected: isDatabaseConnected,
+    ok: isHealthy,
+    database: {
+      connected: isDatabaseConnected,
+      mode: isDatabaseConnected ? 'mongodb' : (!MONGO_URI && !isProduction ? 'demo' : 'mongodb_error'),
+    },
     mode: isDatabaseConnected ? 'mongodb' : (!MONGO_URI && !isProduction ? 'demo' : 'mongodb_error'),
-  },
-  mode: isDatabaseConnected ? 'mongodb' : (!MONGO_URI && !isProduction ? 'demo' : 'mongodb_error'),
     message: isHealthy ? 'NammaFix AI backend is running.' : 'Database connectivity issue detected.',
   });
 });
 
 app.use('/api', (req, res, next) => {
-  if (isProduction && mongoose.connection.readyState !== 1) {
+  if ((MONGO_URI || isProduction) && mongoose.connection.readyState !== 1) {
     return res.status(503).json({ message: 'Database is unavailable.' });
   }
   return next();
@@ -1044,7 +1152,15 @@ app.post('/api/auth/signup', rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 
   const normalizedEmail = String(email).trim().toLowerCase();
   const trimmedName = String(name).trim();
 
-  if (!trimmedName || !normalizedEmail || String(password).length < 8) {
+  if (
+    !trimmedName
+    || trimmedName.length > 120
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)
+    || normalizedEmail.length > 254
+    || typeof password !== 'string'
+    || password.length < 8
+    || Buffer.byteLength(password, 'utf8') > 72
+  ) {
     return res.status(400).json({ message: 'Please provide a valid name, email and a password with at least 8 characters.' });
   }
 
@@ -1059,14 +1175,14 @@ app.post('/api/auth/signup', rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 
       const user = await User.create({
         name: trimmedName,
         email: normalizedEmail,
-        role: 'user',
+        role: 'citizen',
         passwordHash,
       });
 
       const token = createUserToken(user.toObject());
       return res.status(201).json({
         token,
-        user: { id: user._id.toString(), name: user.name, email: user.email, role: user.role },
+        user: { id: user._id.toString(), name: user.name, email: user.email, role: user.role === 'user' ? 'citizen' : user.role },
         message: 'Account created successfully.',
       });
     }
@@ -1080,7 +1196,7 @@ app.post('/api/auth/signup', rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 
       id: `user-${Date.now()}`,
       name: trimmedName,
       email: normalizedEmail,
-      role: 'user',
+      role: 'citizen',
       passwordHash: await hashPassword(password),
       createdAt: new Date().toISOString(),
     };
@@ -1117,7 +1233,7 @@ app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, maxRequests: 1
       const token = createUserToken(user);
       return res.json({
         token,
-        user: { id: user._id.toString(), name: user.name, email: user.email, role: user.role },
+        user: { id: user._id.toString(), name: user.name, email: user.email, role: user.role === 'user' ? 'citizen' : user.role },
         message: 'Login successful.',
       });
     }
@@ -1130,7 +1246,7 @@ app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, maxRequests: 1
     const token = createUserToken(user);
     return res.json({
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+      user: { id: user.id, name: user.name, email: user.email, role: 'citizen' },
       message: 'Login successful.',
     });
   } catch (error) {
@@ -1142,7 +1258,7 @@ app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, maxRequests: 1
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     if (mongoose.connection.readyState === 1) {
-      const user = await User.findOne({ email: req.user.sub }).lean();
+      const user = await User.findOne(req.user.id ? { _id: req.user.id } : { email: req.user.sub }).lean();
       if (!user) {
         return res.status(404).json({ message: 'User not found.' });
       }
@@ -1151,7 +1267,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
         id: user._id.toString(),
         name: user.name,
         email: user.email,
-        role: user.role,
+        role: user.role === 'user' ? 'citizen' : user.role,
       });
     }
 
@@ -1164,7 +1280,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
       id: user.id,
       name: user.name,
       email: user.email,
-      role: user.role,
+      role: user.role === 'user' ? 'citizen' : user.role,
     });
   } catch (error) {
     console.error('User profile lookup failed:', error.name);
@@ -1172,8 +1288,89 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/admin/login', rateLimit({ windowMs: 15 * 60 * 1000, maxRequests: 10, message: 'Too many login attempts. Try again later.' }), (req, res) => {
-  const { username, password } = req.body || {};
+app.patch('/api/auth/me', requireCitizen, async (req, res) => {
+  const { name } = req.body || {};
+  if (typeof name !== 'string' || !name.trim() || name.trim().length > 120) {
+    return res.status(400).json({ message: 'Name must be a non-empty string of 120 characters or fewer.' });
+  }
+
+  try {
+    if (mongoose.connection.readyState === 1) {
+      const user = await User.findByIdAndUpdate(
+        req.user.id,
+        { $set: { name: name.trim() } },
+        { new: true, runValidators: true, projection: { name: 1, email: 1, role: 1 } },
+      ).lean();
+      if (!user) return res.status(404).json({ message: 'User not found.' });
+      return res.json({ id: String(user._id), name: user.name, email: user.email, role: user.role === 'user' ? 'citizen' : user.role });
+    }
+
+    const user = inMemoryUsers.find((entry) => entry.id === req.user.id);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    user.name = name.trim();
+    return res.json({ id: user.id, name: user.name, email: user.email, role: 'citizen' });
+  } catch (error) {
+    console.error('User profile update failed:', error.name);
+    return res.status(500).json({ message: 'Unable to update the profile.' });
+  }
+});
+
+app.post('/api/auth/change-password', requireCitizen, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (
+    typeof currentPassword !== 'string'
+    || typeof newPassword !== 'string'
+    || newPassword.length < 8
+    || Buffer.byteLength(newPassword, 'utf8') > 72
+  ) {
+    return res.status(400).json({ message: 'Provide the current password and a new password between 8 and 72 UTF-8 bytes.' });
+  }
+
+  try {
+    const user = mongoose.connection.readyState === 1
+      ? await User.findById(req.user.id)
+      : inMemoryUsers.find((entry) => entry.id === req.user.id);
+    if (!user || !(await comparePassword(currentPassword, user.passwordHash))) {
+      return res.status(401).json({ message: 'Current password is incorrect.' });
+    }
+    user.passwordHash = await hashPassword(newPassword);
+    user.authVersion = (user.authVersion || 0) + 1;
+    await user.save?.();
+    return res.json({ message: 'Password changed. Sign in again with your new password.' });
+  } catch (error) {
+    console.error('Password change failed:', error.name);
+    return res.status(500).json({ message: 'Unable to change the password.' });
+  }
+});
+
+app.post('/api/admin/login', rateLimit({ windowMs: 15 * 60 * 1000, maxRequests: 10, message: 'Too many login attempts. Try again later.' }), async (req, res) => {
+  const { email, username, password } = req.body || {};
+
+  if (typeof email === 'string') {
+    if (!email.trim() || typeof password !== 'string' || !password) {
+      return res.status(400).json({ message: 'Email and password are required.' });
+    }
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({ message: 'Database is unavailable.' });
+    }
+
+    try {
+      const normalizedEmail = email.trim().toLowerCase();
+      const admin = await User.findOne({ email: normalizedEmail, role: 'admin' }).lean();
+      if (!admin || !(await comparePassword(password, admin.passwordHash))) {
+        return res.status(401).json({ message: 'Invalid admin credentials.' });
+      }
+      return res.json({
+        token: createUserToken(admin),
+        user: { id: String(admin._id), name: admin.name, email: admin.email, role: 'admin' },
+        role: 'admin',
+      });
+    } catch (error) {
+      console.error('Admin login failed:', error.name);
+      return res.status(500).json({ message: 'Admin login failed.' });
+    }
+  }
+
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
     return res.json({ token: createAdminToken(username), user: username, role: 'admin' });
   }
@@ -1189,7 +1386,7 @@ app.post('/api/complaints/classify', rateLimit({ windowMs: 60 * 1000, maxRequest
   return res.json(classifyComplaint(text.trim()));
 });
 
-app.post('/api/complaints/transcribe', rateLimit({ windowMs: 60 * 1000, maxRequests: 10, message: 'Too many transcription requests. Try again shortly.' }), upload.single('audio'), async (req, res) => {
+app.post('/api/complaints/transcribe', requireCitizen, rateLimit({ windowMs: 60 * 1000, maxRequests: 10, message: 'Too many transcription requests. Try again shortly.' }), upload.single('audio'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: 'Audio file is required for transcription.' });
   }
@@ -1256,7 +1453,7 @@ app.get('/api/dashboard', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/complaints/:id', async (req, res) => {
+app.get('/api/complaints/:id', rateLimit({ windowMs: 60 * 1000, maxRequests: 60, message: 'Too many tracking requests. Try again shortly.' }), async (req, res) => {
   try {
     const complaint = await findComplaintById(req.params.id);
     if (!complaint) return res.status(404).json({ message: 'Complaint not found' });
@@ -1267,11 +1464,45 @@ app.get('/api/complaints/:id', async (req, res) => {
   }
 });
 
-app.post('/api/complaints', rateLimit({ windowMs: 60 * 1000, maxRequests: 10, message: 'Too many complaint submissions. Try again shortly.' }), async (req, res) => {
+app.get('/api/citizen/complaints', requireCitizen, async (req, res) => {
+  const page = Number.parseInt(req.query.page, 10) || 1;
+  const limit = Number.parseInt(req.query.limit, 10) || 20;
+  if (page < 1 || limit < 1 || limit > 50) {
+    return res.status(400).json({ message: 'Page must be positive and limit must be between 1 and 50.' });
+  }
   try {
-    const complaint = await createComplaintFromPayload(req.body || {});
+    return res.json(await getCitizenComplaints(req.user.id, page, limit));
+  } catch (error) {
+    console.error('Citizen complaint list failed:', error.name);
+    return res.status(error.status || 500).json({ message: error.status === 503 ? error.message : 'Failed to load your complaints.' });
+  }
+});
+
+app.get('/api/citizen/summary', requireCitizen, async (req, res) => {
+  try {
+    return res.json(await getCitizenSummary(req.user.id));
+  } catch (error) {
+    console.error('Citizen summary failed:', error.name);
+    return res.status(error.status || 500).json({ message: error.status === 503 ? error.message : 'Failed to calculate your complaint summary.' });
+  }
+});
+
+app.get('/api/citizen/complaints/:id', requireCitizen, async (req, res) => {
+  try {
+    const complaint = await findCitizenComplaintById(req.params.id, req.user.id);
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found.' });
+    return res.json(complaint);
+  } catch (error) {
+    console.error('Citizen complaint detail lookup failed:', error.name);
+    return res.status(error.status || 500).json({ message: error.status === 503 ? error.message : 'Failed to fetch complaint.' });
+  }
+});
+
+app.post('/api/complaints', requireCitizen, rateLimit({ windowMs: 60 * 1000, maxRequests: 10, message: 'Too many complaint submissions. Try again shortly.' }), async (req, res) => {
+  try {
+    const complaint = await createComplaintFromPayload(req.body || {}, req.user.id);
     return res.status(201).json({
-      ...toPublicTrackingRecord(complaint),
+      ...toCitizenComplaintRecord(complaint),
       persistenceMode: mongoose.connection.readyState === 1 ? 'mongodb' : 'demo-memory',
       geocodingMessage: complaint.geocodingStatus === 'success'
         ? 'Location matched by OpenStreetMap Nominatim; geocoding identifies an address match, not the user’s exact position.'
@@ -1329,10 +1560,13 @@ app.get('/api/stats', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/complaints/:id/confirmation', rateLimit({ windowMs: 60 * 1000, maxRequests: 10, message: 'Too many audio confirmation requests. Try again shortly.' }), async (req, res) => {
+app.get('/api/complaints/:id/confirmation', requireAuth, rateLimit({ windowMs: 60 * 1000, maxRequests: 10, message: 'Too many audio confirmation requests. Try again shortly.' }), async (req, res) => {
   try {
     const complaint = await findComplaintById(req.params.id);
     if (!complaint) return res.status(404).json({ message: 'Complaint not found' });
+    if (req.user.role !== 'admin' && complaint.ownerId !== req.user.id) {
+      return res.status(404).json({ message: 'Complaint not found' });
+    }
 
     const text = `உங்கள் புகார் ${complaint.ticketId} பதிவு செய்யப்பட்டுள்ளது. ${complaint.category} பிரச்சனைக்கு விரைவாக நடவடிக்கை எடுக்கப்படும்.`;
     const result = await synthesizeTamilConfirmation(text);
